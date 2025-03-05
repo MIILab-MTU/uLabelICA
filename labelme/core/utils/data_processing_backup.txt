@@ -1,0 +1,874 @@
+import matlab.engine
+import io
+import webcolors
+import numpy as np
+import os
+import math
+import cv2
+import argparse
+import networkx as nx
+import matplotlib.pyplot as plt
+import pickle
+import argparse
+
+from scipy.interpolate import interp1d
+from tqdm import tqdm
+from skimage import measure
+
+from core.utils.helper_functions import str2bool
+from core.utils.module import Node, VesselSegment
+from batchgenerators.utilities.data_splitting import get_split_deterministic
+
+########################################################################################################################
+# code for step 1
+def skeleton_by_matlab(file_path, eng, show=False, save_path=None):
+    """
+    calculate the skeleton by matlab function
+    :param file_path: file path to binary image_x
+    :return:
+    """
+    ret = eng.skeleton_matlab(file_path)
+    skeleton_image = np.array(ret, dtype=np.int32)
+    image_size = skeleton_image.shape[0]
+    if show:
+        fig, ax = plt.subplots()
+        ax.imshow(skeleton_image, cmap=plt.cm.gray)
+        plt.axis('off')
+        fig.set_size_inches(image_size/100, image_size/100)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        plt.gca().xaxis.set_major_locator(plt.NullLocator())
+        plt.gca().yaxis.set_major_locator(plt.NullLocator())
+        plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0.0, wspace=0.0)
+        plt.margins(0, 0)
+        plt.savefig(save_path)
+        plt.close()
+
+    return skeleton_image
+
+
+def remove_isolated_segment(skeleton_image, show=False, save_path=None):
+    labeling = measure.label(skeleton_image)
+    regions = measure.regionprops(labeling)
+    largest_region = None
+    image_size = skeleton_image.shape[0]
+    area_max = 0.
+    for region in regions:
+        if region.area > area_max:
+            area_max = region.area
+            largest_region = region
+
+    bin_image = np.zeros_like(skeleton_image)
+    for coord in largest_region.coords:
+        bin_image[coord[0], coord[1]] = 1
+
+    if show:
+        fig, ax = plt.subplots()
+        ax.imshow(bin_image, cmap=plt.cm.gray)
+        plt.axis('off')
+        fig.set_size_inches(image_size/100, image_size/100)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        plt.gca().xaxis.set_major_locator(plt.NullLocator())
+        plt.gca().yaxis.set_major_locator(plt.NullLocator())
+        plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0.0, wspace=0.0)
+        plt.margins(0, 0)
+        plt.savefig(save_path)
+        plt.close()
+
+    return bin_image
+
+
+########################################################################################################################
+# code for step 2
+def calculate_end_and_joint_points_by_matlab(vessel_file_path, eng, show=True, save_path=None):
+    """
+    generate the joint points and end points according to matlab code
+    :param vessel_file_path:
+    :param eng:
+    :param show:
+    :return:
+        points: each point is a tuple, and the first element is the column, the second is the row
+    """
+    ret = eng.graph_point_wrapper(vessel_file_path, nargout=5)
+    rj, cj, re, ce, skeleton_image = np.array(ret[0], dtype=np.int32).flatten() - 1, \
+                                     np.array(ret[1], dtype=np.int32).flatten() - 1, \
+                                     np.array(ret[2], dtype=np.int32).flatten() - 1, \
+                                     np.array(ret[3], dtype=np.int32).flatten() - 1, \
+                                     np.array(ret[4], dtype=np.int32)
+    image_size = skeleton_image.shape[0]
+    end_points = []
+    joint_points = []
+
+    points = []
+
+    for i in range(len(rj)):
+        joint_points.append((rj[i], cj[i]))
+    for i in range(len(ce)):
+        end_points.append((re[i], ce[i]))
+
+    # for each point, the first element is the column, the second is the row
+
+    for point in joint_points:
+        adj_matrix = skeleton_image[point[0] - 1:point[0] + 2, point[1] - 1:point[1] + 2]
+        degree = np.sum(adj_matrix == 1) - skeleton_image[point[0], point[1]]
+        points.append(Node(degree, point[0], point[1]))
+        print("joint point {}, degree = {}".format(point, degree))
+
+    for point in end_points:
+        adj_matrix = skeleton_image[point[0] - 1:point[0] + 2, point[1] - 1:point[1] + 2]
+        degree = np.sum(adj_matrix == 1) - skeleton_image[point[0], point[1]]
+        points.append(Node(degree, point[0], point[1]))
+        print("end point {}, degree = {}".format(point, degree))
+
+    if show:
+        vessel_image = cv2.imread(vessel_file_path)
+
+        fig, ax = plt.subplots()
+        plt.axis('off')
+        fig.set_size_inches(image_size/100, image_size/100)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        plt.gca().xaxis.set_major_locator(plt.NullLocator())
+        plt.gca().yaxis.set_major_locator(plt.NullLocator())
+        plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0.0, wspace=0.0)
+        plt.margins(0, 0)
+
+        plt.imshow(vessel_image, cmap='gray')
+        plt.imshow(skeleton_image, alpha=0.6, cmap='gray')
+        plt.scatter(cj, rj, c='r', linewidth=1, marker='*')
+        plt.scatter(ce, re, c='g', linewidth=1, marker='+')
+        #plt.show()
+        plt.savefig(save_path)
+        plt.close()
+    return points
+
+
+########################################################################################################################
+# code for step 3
+def calculate_turning_points(vessel_segment, start_point, end_point, tolerance=11, min_interval=20):
+    point_distance = np.sqrt((start_point.x-end_point.x)**2+(start_point.y-end_point.y)**2)
+    #print("point distance = {}".format(point_distance))
+    if point_distance < tolerance*4:
+        return []
+    points = np.where(vessel_segment==1)
+    point_tuples = []
+    for i in range(len(points[0])):
+        point_tuples.append((points[0][i], points[1][i]))
+
+    r = rdp(point_tuples, tolerance)
+
+    turning_points = []
+    for i in range(len(r)):
+        print("start = {}, end = {}".format(
+            np.sqrt((start_point.x - r[i][0]) ** 2 + (start_point.y - r[i][1]) ** 2),
+            np.sqrt((end_point.x - r[i][0]) ** 2 + (end_point.y - r[i][1]) ** 2)))
+
+        add = True
+        if np.sqrt((start_point.x - r[i][0]) ** 2 + (start_point.y - r[i][1]) ** 2) < min_interval:
+            add = False
+        if np.sqrt((end_point.x - r[i][0]) ** 2 + (end_point.y - r[i][1]) ** 2) < min_interval:
+            add = False
+        # control distance between turning points by using min_interval
+        for tuning_point in turning_points:
+            if np.sqrt((tuning_point.x - r[i][0]) ** 2 + (tuning_point.y - r[i][1]) ** 2) < min_interval:
+                add = False
+        if add:
+            turning_points.append(Node(degree=2, x=r[i][0], y=r[i][1]))
+
+    return turning_points
+
+
+def diameter_map(binary_file_path, eng):
+    ret = eng.matlab_diameter_map(binary_file_path)
+    dist_map = np.array(ret, dtype=np.float32)
+    return dist_map
+
+
+def filter_vessel(vessel_objs, dist_map, patient_name, mean_dist_threshold):
+    v_objs = []
+    pixel_spacing = get_spacing(patient_name)
+
+    for idx, vessel_obj in enumerate(vessel_objs):
+        segment_dist_map = vessel_obj.vessel_centerline * dist_map
+        # assign distance map to each vessel object
+        vessel_obj.vessel_centerline_dist = segment_dist_map
+        # average_dist = np.mean(segment_dist_map[segment_dist_map > 0])
+        max_dist = np.max(segment_dist_map[segment_dist_map > 0])
+
+        if max_dist * pixel_spacing > mean_dist_threshold:
+            v_objs.append(vessel_obj)
+    return v_objs
+
+
+def get_spacing()
+
+def graph_generation_by_connection(nodes, skeleton_img, eng=None, find_turning=True, show=False, save_path=None):
+    """
+    creating VesselSegment objects according to the detected nodes
+    :param nodes:
+    :param skeleton_img:
+    :param eng:
+    :param find_turning:
+    :param show:
+    :param save_path:
+    :return:
+    """
+    vessel_objects = []
+    image_size = skeleton_img.shape[0]
+    for node in nodes:
+        #skeleton_img[node.x, node.y] = 0  # OLD
+        for i in range(node.x-1, node.x+2):
+            for j in range(node.y-1, node.y+2):
+                if i < skeleton_img.shape[0] and j < skeleton_img.shape[1]:
+                    skeleton_img[i, j] = 0
+
+    #labeling = measure.label(skeleton_img, neighbors=8, connectivity=1)
+    labeling = measure.label(skeleton_img)
+    # plt.imshow(labeling)
+    # plt.show()
+
+    turning_points = []
+
+    for idx, label in enumerate(np.unique(labeling)[1:]):
+        vessel_segment = np.zeros_like(labeling)
+        vessel_segment[labeling == label] = 1
+
+        # find end points by matlab
+        cv2.imwrite("tmp.png", vessel_segment)
+        ret = eng.vessel_segment_point("tmp.png", nargout=4)
+        rj, cj, re, ce = np.array(ret[0], dtype=np.int32).flatten() - 1, \
+                         np.array(ret[1], dtype=np.int32).flatten() - 1, \
+                         np.array(ret[2], dtype=np.int32).flatten() - 1, \
+                         np.array(ret[3], dtype=np.int32).flatten() - 1
+        if re.shape[0] == 2:
+            #print("rj {}, cj {}, re {}, ce {}".format(rj, cj, re, ce))
+            edge_points = []
+            for i in range(2):
+                near_dist = np.inf
+                near_node = None
+                for node in nodes:
+                    end_point_x, end_point_y = re[i], ce[i]
+                    dist = np.sqrt((end_point_x - node.x) ** 2 + (end_point_y - node.y) ** 2)
+                    if dist < near_dist:
+                        near_dist = dist
+                        near_node = node
+                edge_points.append(near_node)
+
+            if find_turning:
+                new_turning_points = calculate_turning_points(vessel_segment, start_point=edge_points[0], end_point=edge_points[1])
+                turning_points.extend(new_turning_points)
+
+            fig, ax = plt.subplots()
+            plt.axis('off')
+            fig.set_size_inches(image_size/100, image_size/100)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            plt.gca().xaxis.set_major_locator(plt.NullLocator())
+            plt.gca().yaxis.set_major_locator(plt.NullLocator())
+            plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0.0, wspace=0.0)
+            plt.margins(0, 0)
+            plt.imshow(vessel_segment, cmap="gray")
+            plt.scatter(edge_points[0].y, edge_points[0].x, marker='+')
+            plt.scatter(edge_points[1].y, edge_points[1].x, marker='+')
+            plt.savefig("temp/edge_{}.png".format(idx))
+            plt.close()
+
+            vessel_objects.append(VesselSegment(edge_points[0], edge_points[1], vessel_segment))
+
+        else:
+            print("rj {}, cj {}, re {}, ce {}".format(rj, cj, re, ce))
+            plt.imshow(vessel_segment, cmap="gray")
+            plt.savefig("tmpa.png")
+            plt.close()
+
+    if show:
+        fig, ax = plt.subplots()
+        plt.axis('off')
+        fig.set_size_inches(image_size/100, image_size/100)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        plt.gca().xaxis.set_major_locator(plt.NullLocator())
+        plt.gca().yaxis.set_major_locator(plt.NullLocator())
+        plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0.0, wspace=0.0)
+        plt.margins(0, 0)
+
+        plt.imshow(skeleton_img, cmap='gray')
+        plt.scatter([n.y for n in nodes if n.degree > 2],
+                    [n.x for n in nodes if n.degree > 2],
+                    c='r', linewidth=1, marker='*')
+        plt.scatter([n.y for n in nodes if n.degree == 1],
+                    [n.x for n in nodes if n.degree == 1],
+                    c='g', linewidth=1, marker='+')
+        plt.scatter([n.y for n in nodes if n.degree == 2],
+                    [n.x for n in nodes if n.degree == 2],
+                    c='b', linewidth=1, marker='o')
+        plt.savefig(save_path)
+        plt.close()
+
+    return turning_points, vessel_objects
+
+
+# the code below is for point turning
+def distance(a, b):
+    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
+
+
+def point_line_distance(point, start, end):
+    if start == end:
+        return distance(point, start)
+    else:
+        n = abs((end[0] - start[0]) * (start[1] - point[1]) - (start[0] - point[0]) * (end[1] - start[1]))
+        d = math.sqrt((end[0] - start[0]) ** 2 + (end[1] - start[1]) ** 2)
+        return n / d
+
+
+def rdp(points, epsilon):
+    """
+    Reduces a series of points to a simplified version that loses detail,
+    but maintains the general shape of the series.
+    """
+    dmax = 0.0
+    index = 0
+    for i in range(1, len(points) - 1):
+        d = point_line_distance(points[i], points[0], points[-1])
+        if d > dmax:
+            index = i
+            dmax = d
+
+    if dmax >= epsilon:
+        results = rdp(points[:index+1], epsilon)[:-1] + rdp(points[index:], epsilon)
+    else:
+        results = [points[0], points[-1]]
+
+    return results
+
+
+########################################################################################################################
+# code for step 3.2: merge point
+
+
+########################################################################################################################
+# code for step 4
+def __calculate_perpendicular_line_slope(point, vessel_points):
+    min_dist = np.inf
+    min_point = None
+    for vessel_point in vessel_points:
+        dist = distance((point[0], point[1]), (vessel_point[0], vessel_point[1]))
+        if dist > 0 and dist < min_dist:
+            min_dist = dist
+            min_point = vessel_point
+    if min_point[0] == point[0]:
+        # current line is perpendicular to x-axis, so the perpendicular line is parallel to x-axis with K=0
+        #print("x - node = {}, min_point = {}, slope = 0.".format((point[0], point[1]), (min_point[0], min_point[1])))
+        return 0.
+    elif min_point[1] == point[1]:
+        # current line is perpendicular to y-axis, so the perpendicular line is parallel to y-axis with K=np.inf
+        #print("y - node = {}, min_point = {}, slope = np.inf".format((point[0], point[1]), (min_point[0], min_point[1])))
+        return np.inf
+    else:
+        slope = (min_point[1] - point[1]) / (min_point[0] - point[0])
+        slope = -1/slope
+        #print("node = {}, min_point = {}, slope = {}".format((point[0], point[1]), (min_point[0], min_point[1]), slope))
+        return slope
+
+
+def __interpolate_centerline_points(vessel_info, interpolation_method='cubic', interp_num=5):
+    vessel_points = []
+    num_points_in_centerline = len(np.where(vessel_info.vessel_centerline==1)[0])
+    for i in range(num_points_in_centerline):
+        vessel_points.append((np.where(vessel_info.vessel_centerline==1)[0][i],
+                              np.where(vessel_info.vessel_centerline==1)[1][i]))
+    vessel_points = np.array(vessel_points)
+    assert len(vessel_points.shape) == 2
+    assert vessel_points.shape[1] == 2
+
+    alpha = np.linspace(0, 1, interp_num*num_points_in_centerline)
+
+    distance = np.cumsum(np.sqrt(np.sum(np.diff(vessel_points, axis=0) ** 2, axis=1)))
+    distance = np.insert(distance, 0, 0) / distance[-1]
+    interpolator = interp1d(distance, vessel_points, kind=interpolation_method, axis=0)
+    interpolated_points = interpolator(alpha)  # shape = (interp_num,2)
+    r_points = []
+    for i in range(interp_num*num_points_in_centerline):
+        r_points.append((interpolated_points[i][0], interpolated_points[i][1]))
+    return r_points
+
+
+def __add_adjacent_points(coord, binary_image, adj_size=3):
+    r_points = []
+    for i in range(-(adj_size//2), (adj_size//2)+1):
+        for j in range(-(adj_size//2), (adj_size//2)+1):
+            if i == j == 0:
+                continue
+            if binary_image[coord[0]+i, coord[1]+j] > 0:
+                r_points.append((coord[0]+i, coord[1]+j))
+    return r_points
+
+
+def __find_vessel_pixel(center_point, slope, binary_image, offset=10, interpolation_interval=0.1, adj_size=5):
+    assert len(center_point) == 2
+    # to right
+    vessel_pixel_coords = []
+    vessel_pixel_coords.append((int(center_point[0]), int(center_point[1])))
+    ## the code is for calculate the `right` part of the vessel
+    for delta_x in np.arange(interpolation_interval, offset, interpolation_interval):
+        if slope == np.inf:
+            current_x = center_point[0]
+            current_y = center_point[1] + delta_x
+        else:
+            current_x = center_point[0] + delta_x
+            current_y = slope * delta_x + center_point[1]
+        current_y = np.clip(current_y, 2, binary_image.shape[0] - 2)
+        if distance(center_point, (current_x, current_y)) < offset:
+            if binary_image[int(np.round(current_x)), int(np.round(current_y))] > 0:
+                vessel_pixel_coords.append((int(np.round(current_x)), int(np.round(current_y))))
+                vessel_pixel_coords.extend(__add_adjacent_points((int(np.round(current_x)), int(np.round(current_y))), binary_image, adj_size))
+            elif binary_image[int(np.round(current_x)), int(np.ceil(current_y))] > 0:
+                vessel_pixel_coords.append((int(np.round(current_x)), int(np.ceil(current_y))))
+                vessel_pixel_coords.extend(__add_adjacent_points((int(np.round(current_x)), int(np.ceil(current_y))), binary_image, adj_size))
+            elif binary_image[int(np.ceil(current_x)), int(np.ceil(current_y))] > 0:
+                vessel_pixel_coords.append((int(np.ceil(current_x)), int(np.ceil(current_y))))
+                vessel_pixel_coords.extend(__add_adjacent_points((int(np.ceil(current_x)), int(np.ceil(current_y))), binary_image, adj_size))
+            elif binary_image[int(np.ceil(current_x)), int(np.round(current_y))] > 0:
+                vessel_pixel_coords.append((int(np.ceil(current_x)), int(np.round(current_y))))
+                vessel_pixel_coords.extend(__add_adjacent_points((int(np.ceil(current_x)), int(np.round(current_y))), binary_image, adj_size))
+            else:
+                break
+
+    ## the code is for calculate the `left` part of the vessel
+    for delta_x in np.arange(interpolation_interval, offset, interpolation_interval):
+        if slope == np.inf:
+            current_x = center_point[0]
+            current_y = center_point[1] - delta_x
+        else:
+            current_x = center_point[0] - delta_x
+            current_y = slope * (-delta_x) + center_point[1]
+        current_y = np.clip(current_y, 2, binary_image.shape[0]-2)
+        if distance(center_point, (current_x, current_y)) < offset:
+            if binary_image[int(np.round(current_x)), int(np.round(current_y))] > 0:
+                vessel_pixel_coords.append((int(np.round(current_x)), int(np.round(current_y))))
+                vessel_pixel_coords.extend(__add_adjacent_points((int(np.round(current_x)), int(np.round(current_y))), binary_image, adj_size))
+            elif binary_image[int(np.round(current_x)), int(np.ceil(current_y))] > 0:
+                vessel_pixel_coords.append((int(np.round(current_x)), int(np.ceil(current_y))))
+                vessel_pixel_coords.extend(__add_adjacent_points((int(np.round(current_x)), int(np.ceil(current_y))), binary_image, adj_size))
+            elif binary_image[int(np.ceil(current_x)), int(np.ceil(current_y))] > 0:
+                vessel_pixel_coords.append((int(np.ceil(current_x)), int(np.ceil(current_y))))
+                vessel_pixel_coords.extend(__add_adjacent_points((int(np.ceil(current_x)), int(np.ceil(current_y))), binary_image, adj_size))
+            elif binary_image[int(np.ceil(current_x)), int(np.round(current_y))] > 0:
+                vessel_pixel_coords.append((int(np.ceil(current_x)), int(np.round(current_y))))
+                vessel_pixel_coords.extend(__add_adjacent_points((int(np.ceil(current_x)), int(np.round(current_y))), binary_image, adj_size))
+            else:
+                break
+
+    return vessel_pixel_coords
+
+
+def find_vessel_pixel_in_centerline(vessel_infos, binary_image, show=False, save_path=None):
+
+    def __generate_vessel_binary_map(vessel_pixel_coords, vessel_mask):
+        for vessel_pixel_coord in vessel_pixel_coords:
+            if binary_image[vessel_pixel_coord[0], vessel_pixel_coord[1]] > 0:
+                vessel_mask[vessel_pixel_coord[0], vessel_pixel_coord[1]] = 1
+        return vessel_mask
+
+    """
+    vessel_contour = measure.find_contours(binary_image, 0.5)
+    plt.imshow(vessel_contour)
+    plt.show()
+    """
+
+    total_mask = np.zeros_like(binary_image)
+    image_size = binary_image.shape[0]
+
+    for vessel_info in vessel_infos:
+        vessel_points = __interpolate_centerline_points(vessel_info, interpolation_method='slinear', interp_num=5)
+        vessel_mask = np.zeros_like(binary_image)
+        for vessel_point in vessel_points:
+            slope = __calculate_perpendicular_line_slope(vessel_point, vessel_points)
+            vessel_pixel_coordinates = __find_vessel_pixel(vessel_point, slope, binary_image, offset=8, interpolation_interval=0.5, adj_size=3)
+            vessel_mask = __generate_vessel_binary_map(vessel_pixel_coordinates, vessel_mask)
+            vessel_info.vessel_mask = vessel_mask
+
+        total_mask += vessel_mask
+
+        """
+        if show:
+            fig, ax = plt.subplots()
+            ax.imshow(vessel_info.vessel_centerline, cmap='gray')
+            ax.imshow(vessel_mask, alpha=0.6, cmap='gray')
+            plt.axis('off')
+            fig.set_size_inches(5.12, 5.12)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            plt.gca().xaxis.set_major_locator(plt.NullLocator())
+            plt.gca().yaxis.set_major_locator(plt.NullLocator())
+            plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0.0, wspace=0.0)
+            plt.margins(0, 0)
+            plt.show()
+        """
+
+    total_mask = np.clip(total_mask, 0, 1)
+    print(np.sum(binary_image>0))
+    print(np.sum(total_mask > 0))
+
+    if show:
+        fig, ax = plt.subplots()
+        ax.imshow(binary_image, cmap='gray')
+        ax.imshow(total_mask, alpha=0.6, cmap='gray')
+        plt.axis('off')
+        fig.set_size_inches(image_size/100, image_size/100)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        plt.gca().xaxis.set_major_locator(plt.NullLocator())
+        plt.gca().yaxis.set_major_locator(plt.NullLocator())
+        plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0.0, wspace=0.0)
+        plt.margins(0, 0)
+        plt.savefig(save_path)
+        plt.close()
+
+    return vessel_infos
+
+########################################################################################################################
+# code for step 5
+def assign_class(vessel_infos: list, semantic_image, semantic_mapping: dict, show=False, save_path=None):
+    def __get_class(coord):
+        for key in semantic_mapping.keys():
+            if semantic_image[coord[0], coord[1]][0] == semantic_mapping[key][0]:
+                if semantic_image[coord[0], coord[1]][1] == semantic_mapping[key][1]:
+                    if semantic_image[coord[0], coord[1]][2] == semantic_mapping[key][2]:
+                        return key
+        return process.VESSEL_OTHER_COLOR_KEY
+
+    image_size = semantic_image.shape[0]
+
+    for vessel_object in vessel_infos:
+        num_pixels = np.sum(vessel_object.vessel_mask>0)
+        count_dict = {k: 0 for k in semantic_mapping.keys()}
+
+        for i in range(num_pixels):
+            try:
+                vessel_pixel_coord = (np.where(vessel_object.vessel_mask == 1)[0][i], np.where(vessel_object.vessel_mask == 1)[1][i])
+                clazz = __get_class(vessel_pixel_coord)
+                count_dict[clazz] = count_dict[clazz]+1
+            except:
+                vessel_object.vessel_mask[vessel_pixel_coord[0], vessel_pixel_coord[1]] = 0
+                print("coord = {}, color = {}".format(vessel_pixel_coord, semantic_image[vessel_pixel_coord[0], vessel_pixel_coord[1]]))
+        #print(count_dict)
+        count_dict = sorted(count_dict.items(), key=lambda x: x[1])[::-1]
+        vessel_object.vessel_class = count_dict[0][0]
+
+    if show:
+        processed_semantic_vessel = np.zeros_like(semantic_image)
+        for vessel_object in vessel_infos:
+            processed_semantic_vessel[:, :, 0][vessel_object.vessel_mask == 1] = semantic_mapping[vessel_object.vessel_class][0]
+            processed_semantic_vessel[:, :, 1][vessel_object.vessel_mask == 1] = semantic_mapping[vessel_object.vessel_class][1]
+            processed_semantic_vessel[:, :, 2][vessel_object.vessel_mask == 1] = semantic_mapping[vessel_object.vessel_class][2]
+
+        fig, ax = plt.subplots()
+        ax.imshow(processed_semantic_vessel)
+        plt.axis('off')
+        fig.set_size_inches(image_size/100, image_size/100)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        plt.gca().xaxis.set_major_locator(plt.NullLocator())
+        plt.gca().yaxis.set_major_locator(plt.NullLocator())
+        plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0.0, wspace=0.0)
+        plt.margins(0, 0)
+        plt.savefig(save_path)
+        plt.close()
+
+    return vessel_infos
+
+########################################################################################################################
+
+
+
+# code for step 6: merge node
+def merge_segments(vessel_infos, radius=10, pixel_num_threshold=50):
+    merged_vessel_infos = []
+    for i in range(len(vessel_infos)):
+        # search within the radius
+        if np.sum(vessel_infos[i].vessel_centerline) < pixel_num_threshold:
+            if vessel_infos[i].node1.degree == vessel_infos[i].node2.degree == 3:
+                for vessel_i_node in [vessel_infos[i].node1, vessel_infos[i].node2]:
+                    near_vessel_segments_idx = []
+                    near_vessel_segments_node_idx = []
+                    for j in range(len(vessel_infos)):
+                        if i != j and \
+                                (np.sum(vessel_infos[i].vessel_centerline > 0) < pixel_num_threshold) and \
+                                (np.sum(vessel_infos[j].vessel_centerline > 0) < pixel_num_threshold):
+                            # check node1 in vessel_infos[i].node1
+                            d1 = None
+                            if distance((vessel_i_node.x, vessel_i_node.node1.y), (vessel_infos[j].node1.x, vessel_infos[j].node1.y)) < radius:
+                                near_vessel_segments_idx.append(j)
+                                near_vessel_segments_node_idx.append(1)
+                            if distance((vessel_infos[i].node1.x, vessel_infos[i].node1.y), (vessel_infos[j].node2.x, vessel_infos[j].node2.y)) < radius:
+                                near_vessel_segments_idx.append(j)
+                                near_vessel_segments_node_idx.append(2)
+
+
+                    if len(near_vessel_segments_idx) > 0:
+                        new_node_center_x = vessel_infos[i].node1.x
+                        new_node_center_y = vessel_infos[i].node1.y
+
+
+
+########################################################################################################################
+def visualize_graph(vessel_infos, original_image, save_path, assign_label=False):
+    image_size = original_image.shape[0]
+    fig, ax = plt.subplots()
+    ax.imshow(original_image, cmap="gray")
+    assigned_labels = []
+    for vessel_info in vessel_infos:
+        if vessel_info.node1.degree == 1:
+            plt.scatter(vessel_info.node1.y, vessel_info.node1.x, c='g', linewidth=1, marker='+')
+        elif vessel_info.node1.degree == 2:
+            plt.scatter(vessel_info.node1.y, vessel_info.node1.x, c='b', linewidth=1, marker='o')
+        else:
+            plt.scatter(vessel_info.node1.y, vessel_info.node1.x, c='r', linewidth=1, marker='*')
+
+        if vessel_info.node2.degree == 1:
+            plt.scatter(vessel_info.node2.y, vessel_info.node2.x, c='g', linewidth=1, marker='+')
+        elif vessel_info.node2.degree == 2:
+            plt.scatter(vessel_info.node2.y, vessel_info.node2.x, c='b', linewidth=1, marker='o')
+        else:
+            plt.scatter(vessel_info.node2.y, vessel_info.node2.x, c='r', linewidth=1, marker='*')
+
+        if assign_label:
+            if vessel_info.vessel_class not in assigned_labels:
+                plt.plot([vessel_info.node1.y, vessel_info.node2.y], [vessel_info.node1.x, vessel_info.node2.x], '-',
+                         color=webcolors.rgb_to_hex(process.ALL_COLOR_MAP[vessel_info.vessel_class]),
+                         label=vessel_info.vessel_class)
+                assigned_labels.append(vessel_info.vessel_class)
+            else:
+                plt.plot([vessel_info.node1.y, vessel_info.node2.y], [vessel_info.node1.x, vessel_info.node2.x], '-',
+                         color=webcolors.rgb_to_hex(process.ALL_COLOR_MAP[vessel_info.vessel_class]))
+        else:
+            # assign white
+            plt.plot([vessel_info.node1.y, vessel_info.node2.y], [vessel_info.node1.x, vessel_info.node2.x], '-', color="#ffffff")
+
+    if assign_label:
+        plt.legend()
+
+    plt.axis('off')
+    fig.set_size_inches(image_size/100, image_size/100)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    plt.gca().xaxis.set_major_locator(plt.NullLocator())
+    plt.gca().yaxis.set_major_locator(plt.NullLocator())
+    plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0.0, wspace=0.0)
+    plt.margins(0, 0)
+    plt.savefig(save_path)
+    plt.close()
+
+def visualize_centerline(vessel_infos, original_image, save_path, with_ori=True, with_joint=True):
+    image_size = original_image.shape[0]
+    fig, ax = plt.subplots()
+    # ax.imshow(original_image, cmap="gray")
+    if with_ori:
+        plt.imshow(original_image, cmap='gray')
+
+    plt.axis('off')
+    fig.set_size_inches(image_size / 100, image_size / 100)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    plt.gca().xaxis.set_major_locator(plt.NullLocator())
+    plt.gca().yaxis.set_major_locator(plt.NullLocator())
+    plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0.0, wspace=0.0)
+    plt.margins(0, 0)
+
+    centerline_img = np.zeros_like(original_image)
+
+    for vessel_info in vessel_infos:
+        if vessel_info.node1.degree == 1:
+            if with_joint:
+                # plt.scatter(vessel_info.node1.y, vessel_info.node1.x, c='g', linewidth=2, marker='+', s=100)
+                plt.scatter(vessel_info.node1.y, vessel_info.node1.x, c='limegreen', linewidth=2, marker='*', s=100)
+        elif vessel_info.node1.degree == 2:
+            plt.scatter(vessel_info.node1.y, vessel_info.node1.x, c='b', linewidth=1, marker='o')
+        else:
+            if with_joint:
+                plt.scatter(vessel_info.node1.y, vessel_info.node1.x, c='r', linewidth=2, marker='*', s=100)
+
+        if vessel_info.node2.degree == 1:
+            if with_joint:
+                # plt.scatter(vessel_info.node1.y, vessel_info.node1.x, c='g', linewidth=2, marker='+', s=100)
+                plt.scatter(vessel_info.node2.y, vessel_info.node2.x, c='limegreen', linewidth=2, marker='*', s=100)
+        elif vessel_info.node2.degree == 2:
+            plt.scatter(vessel_info.node2.y, vessel_info.node2.x, c='b', linewidth=1, marker='o')
+        else:
+            if with_joint:
+                plt.scatter(vessel_info.node2.y, vessel_info.node2.x, c='r', linewidth=2, marker='*', s=100)
+
+        centerline_img[vessel_info.vessel_centerline > 0] = 1.
+
+    if with_ori:
+        plt.imshow(centerline_img, alpha=0.6, cmap='gray')
+    else:
+        plt.imshow(centerline_img, cmap='gray')
+    plt.savefig(save_path)
+    plt.close()
+
+
+def save_vessel_objs(vessel_objects, file_path):
+    pickle.dump(vessel_objects, open(file_path, 'wb'))
+
+
+
+def process_single_image(eng, patient_name, original_image_path, binary_file_path, save_dir, show_image=True, mean_dist_threshold=0.9):
+    original_image = cv2.imread(original_image_path, cv2.IMREAD_GRAYSCALE)
+
+    # step 1: generate centerlines
+    skeleton_image = skeleton_by_matlab(binary_file_path, eng, show=show_image,
+                                        save_path=os.path.join(save_dir, "{}_step1_skeleton.png".format(patient_name)))
+    skeleton_image = remove_isolated_segment(skeleton_image, show=show_image,
+                                             save_path=os.path.join(save_dir, "{}_step1_connected_skeleton.png".format(patient_name)))
+
+    # step2: calculate end points and joint points
+    nodes = calculate_end_and_joint_points_by_matlab(binary_file_path, eng, show=True,
+                                                     save_path=os.path.join(save_dir,"{}_step2_skeleton_with_points.png".format(patient_name)))
+
+    original_vessel_objects = graph_generation_by_connection(nodes, skeleton_image, eng, show=True, find_turning=False,
+                                                             save_path=os.path.join(save_dir, "{}_step2_skeleton_with_all_points.png".format(patient_name)))
+
+    # visualize_graph(vessel_objects, cv2.imread(ori_img_path, cv2.IMREAD_GRAYSCALE),
+    #                 save_path=os.path.join(save_dir, "{}_step2_generated_graph.png".format(patient_name)))
+    visualize_centerline(original_vessel_objects, cv2.imread(original_image_path, cv2.IMREAD_GRAYSCALE),
+                         save_path=os.path.join(save_dir, "{}_step2_generated_centerline.png".format(patient_name)))
+    visualize_centerline(original_vessel_objects, cv2.imread(original_image_path, cv2.IMREAD_GRAYSCALE),
+                         save_path=os.path.join(save_dir, "{}_step2_generated_centerline_pure.png".format(patient_name)),
+                         with_ori=False, with_joint=False)
+
+    # step3: calculate the distance map
+    dist_map = diameter_map(binary_file_path, eng)
+
+    # step4: filter vessel objects: remove the vessel segment with the average diameter less than threshold
+    filtered_vessel_objects = filter_vessel(original_vessel_objects, dist_map, patient_name[:patient_name.rfind("_y")],
+                                            mean_dist_threshold=mean_dist_threshold)
+
+    visualize_centerline(filtered_vessel_objects, cv2.imread(ori_img_path, cv2.IMREAD_GRAYSCALE),
+                         save_path=os.path.join(save_dir, "{}_step4_filtered_centerline.png".format(patient_name)))
+    visualize_centerline(filtered_vessel_objects, cv2.imread(ori_img_path, cv2.IMREAD_GRAYSCALE),
+                         save_path=os.path.join(save_dir, "{}_step4_filtered_centerline_pure.png".format(patient_name)),
+                         with_ori=False, with_joint=False)
+
+
+# def process_single_patient(eng,
+#                            patient_name,
+#                            original_image_path,
+#                            binary,
+#                            show_image,
+#                            save_dir,
+#                            color_map=process.ALL_COLOR_MAP):
+#     original_file_path = './data_no_semantic/training/{}.png'.format(patient_name)
+#     binary_file_path = './data_no_semantic/label/{}.png'.format(patient_name)
+#     semantic_file_path = './data_no_semantic/data_y/{}.png'.format(patient_name)
+#     original_image = cv2.imread(original_file_path, cv2.IMREAD_GRAYSCALE)
+#
+#     # step 1: generate center lines
+#     skeleton_image = skeleton_by_matlab(binary_file_path, eng, show=show_image,
+#                                         save_path=os.path.join(save_dir, "{}_step1_skeleton.png".format(patient_name)))
+#     skeleton_image = remove_isolated_segment(skeleton_image, show=show_image,
+#                                         save_path=os.path.join(save_dir, "{}_step1_connected_skeleton.png".format(patient_name)))
+#
+#
+#     # show_image(skeleton_image)
+#
+#     # step 2: calculate end points and joint points
+#     nodes = calculate_end_and_joint_points_by_matlab(binary_file_path, eng, show=show_image,
+#                                                      save_path=os.path.join(save_dir,
+#                                                                             "{}_step2_skeleton_with_points.png".format(
+#                                                                                 patient_name)))
+#     # step 3: using rdp algorithm to generate turning points and vessel segment objects
+#
+#     dist_map = diameter_map(binary_img_path, eng)
+#
+#     # step4: filter vessel objects: remove the vessel segment with the average diameter less than threshold
+#     filtered_vessel_objects = filter_vessel(original_vessel_objects, dist_map, patient_name[:patient_name.rfind("_y")],
+#                                             mean_dist_threshold=mean_dist_threshold)
+#
+#     _, vessel_objects = graph_generation_by_connection(nodes, skeleton_image, eng, find_turning=False,
+#                                                        show=show_image,
+#                                                        save_path=os.path.join(save_dir,
+#                                                                               "{}_step3_skeleton_with_all_points.png".format(
+#                                                                                   patient_name)))
+#     if show_image:
+#         visualize_graph(vessel_objects, original_image,
+#                         save_path=os.path.join(save_dir, "{}_step3_generated_graph.png".format(patient_name)))
+#
+#     # step 3.2: merge node: merge nearest nodes
+#
+#     # step 4: map each centerline to vessel pixels
+#     vessel_binary_image = cv2.imread(binary_file_path, cv2.IMREAD_GRAYSCALE)
+#     vessel_objects = find_vessel_pixel_in_centerline(vessel_objects, vessel_binary_image, show=show_image,
+#                                                      save_path=os.path.join(save_dir,
+#                                                                             "{}_step4_vessel_search.png".format(
+#                                                                                 patient_name)))
+#
+#     # step 5: assign class information to each vessel segments
+#     semantic_image = cv2.imread(semantic_file_path, cv2.IMREAD_COLOR)
+#     semantic_image = cv2.cvtColor(semantic_image, cv2.COLOR_BGR2RGB)
+#     vessel_objects = assign_class(vessel_objects, semantic_image, color_map, show=show_image,
+#                                   save_path=os.path.join(save_dir, "{}_step5_vessel_assign.png".format(patient_name)))
+#
+#     if show_image:
+#         visualize_graph(vessel_objects,
+#                         original_image,
+#                         save_path=os.path.join(save_dir, "{}_step5_generated_graph.png".format(patient_name)), assign_label=True)
+#
+#     # step 6: term graph
+#     # if show_image:
+#     #     visualize_graph(vessel_objects, original_image,
+#     #                     save_path=os.path.join(save_dir, "{}_step6_generated_graph_deletesmall.png".format(patient_name)),
+#     #                     assign_label=True)
+#
+#     # save objects
+#     save_vessel_objs(vessel_objects, file_path=os.path.join(save_dir, "{}.pkl".format(patient_name)))
+
+
+########################################################################################################################
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_path', type=str, default='/media/zhaochen/data/fluoro_gnn/data/data_nj_semantic')
+    parser.add_argument('--show_image', type=str2bool, default=True)
+    parser.add_argument('--turning', type=str2bool, default=False)
+    parser.add_argument('--save_dir', type=str, default='./data_no_semantic/five_class_2/')
+
+    parser.add_argument('--specific_patient', type=str2bool, default=True)
+    parser.add_argument('--patient_name', type=str, default='73_LCA_RAO2')
+
+    args = parser.parse_args()
+
+    eng = matlab.engine.start_matlab()
+    #files = os.listdir("./data_no_semantic/label_test/")
+    patients = os.listdir(args.data_path)
+    patients = sorted(patients)
+    save_dir = args.save_dir
+
+    if not os.path.isdir(save_dir):
+        os.makedirs(save_dir)
+
+    if args.specific_patient:
+        # process a specific patient
+        for file in files:
+            if file.endswith(".png"):
+                patient_name = file[:file.rfind('.')]
+                if patient_name == args.patient_name:
+                    process_single_patient(eng, patient_name, show_image, save_dir, turning=turning, color_map=color_map)
+
+    else:
+        # process on all subjects
+        for file in tqdm(processed_files):
+            if file.endswith(".png"):
+                patient_name = file[:file.rfind('.')]
+                if os.path.isfile(os.path.join(save_dir, "{}.pkl".format(patient_name))):
+                    continue
+                print("[x] process {}".format(file))
+                process_single_patient(eng, patient_name, show_image, save_dir, turning=turning, color_map=color_map)
+
+
+
+    # quit MATLAB
+    eng.quit()
+    eng.exit()
